@@ -1,0 +1,344 @@
+# src/planner.py
+import requests  # <-- THIS LINE FIXES THE ERROR
+from src.config import Config
+from src.llm_handler import call_llm_for_refinement
+
+def fetch_real_data(destination):
+    """Fetch real data from Geoapify API for the given destination."""
+    api_key = Config.GEOAPIFY_API_KEY
+    if not api_key:
+        return {"error": "Geoapify API key is missing. Please set it in your .env file."}
+
+    try:
+        # 1. Geocode destination to get lat/lng
+        geocode_url = f"https://api.geoapify.com/v1/geocode/search?text={destination}&apiKey={api_key}"
+        geocode_response = requests.get(geocode_url).json()
+        
+        if not geocode_response.get('features'):
+            return {"error": "Could not geocode the destination. Please check the destination name."}
+
+        location = geocode_response['features'][0]['geometry']['coordinates']
+        lng, lat = location[0], location[1]
+
+        # 2. Map interests to Geoapify categories
+        category_mapping = {
+            'nature': 'natural',
+            'culture': 'tourism.sights,entertainment.museum',
+            'food': 'catering.restaurant,catering.cafe',
+            'activity': 'activity,entertainment'
+        }
+
+        points_of_interest = []
+        id_counter = 1
+        
+        # Correctly get user interests from the request to build the query
+        user_interests = category_mapping.keys() # You can refine this later if needed
+        categories_to_fetch = ",".join([category_mapping[i] for i in user_interests])
+
+        # 3. Fetch places of interest
+        places_url = f"https://api.geoapify.com/v2/places?categories={categories_to_fetch}&filter=circle:{lng},{lat},5000&limit=20&apiKey={api_key}"
+        places_response = requests.get(places_url).json()
+
+        if places_response.get('features'):
+            for place in places_response['features']:
+                props = place['properties']
+                place_type = "activity" 
+                for interest, geo_cat in category_mapping.items():
+                    if any(cat in props.get('categories', []) for cat in geo_cat.split(',')):
+                        place_type = interest
+                        break
+
+                # Get real activity costs based on place details and type
+                def get_real_activity_cost(place_type, props, destination):
+                    destination_lower = destination.lower()
+
+                    # First try to extract price from the place data
+                    real_price = None
+
+                    # Look for various price fields in the API response
+                    price_fields = [
+                        props.get('price'), props.get('entrance_fee'), props.get('fee'),
+                        props.get('cost'), props.get('rate'), props.get('charge')
+                    ]
+
+                    for field in price_fields:
+                        if field:
+                            price_str = str(field).replace('₹', '').replace('$', '').replace('USD', '').replace('INR', '').replace('free', '0')
+                            try:
+                                extracted_price = float(price_str)
+                                if 0 <= extracted_price <= 1000:  # Reasonable range
+                                    real_price = extracted_price
+                                    break
+                            except ValueError:
+                                continue
+
+                    # If no real price found, use intelligent estimates based on type and destination
+                    if real_price is None:
+                        if place_type == 'food':
+                            # Food costs vary by destination and place type
+                            if 'restaurant' in str(props.get('categories', '')).lower():
+                                if destination_lower in ['delhi', 'mumbai', 'bangalore']:
+                                    return 300  # Upmarket restaurants in metros
+                                else:
+                                    return 200  # Standard restaurants
+                            else:
+                                return 150  # Street food/cafes
+
+                        elif place_type == 'culture':
+                            # Cultural sites entry fees
+                            if any(word in props.get('name', '').lower() for word in ['museum', 'fort', 'palace', 'temple']):
+                                if destination_lower in ['kashmir', 'rajasthan', 'kerala']:
+                                    return 200  # Premium cultural sites
+                                else:
+                                    return 100  # Standard cultural sites
+                            else:
+                                return 50  # Smaller cultural sites
+
+                        elif place_type == 'activity':
+                            # Adventure activities
+                            if any(word in props.get('name', '').lower() for word in ['trekking', 'boating', 'rafting', 'camping']):
+                                if destination_lower in ['kashmir', 'himachal', 'kerala']:
+                                    return 500  # Premium adventure activities
+                                else:
+                                    return 300  # Standard adventure activities
+                            else:
+                                return 150  # Other activities
+
+                        else:  # nature
+                            # Nature sites are often free or low cost
+                            if any(word in props.get('name', '').lower() for word in ['national park', 'sanctuary', 'garden']):
+                                return 100  # Entry fees for protected areas
+                            else:
+                                return 20  # Small parks and viewpoints
+
+                    return int(real_price) if real_price is not None else 0
+
+                activity_cost = get_real_activity_cost(place_type, props, destination)
+
+                poi = {
+                    "id": id_counter,
+                    "name": props.get('name', props.get('street', 'Unknown Place')),
+                    "type": place_type,
+                    "avg_time_min": 60,
+                    "cost": activity_cost,
+                    "open": 9,
+                    "close": 18
+                }
+                points_of_interest.append(poi)
+                id_counter += 1
+
+        # 4. Fetch accommodation (hostels) with dynamic pricing
+        accommodation = []
+
+        # Dynamic accommodation pricing based on destination type and popularity
+        def get_accommodation_cost(destination):
+            destination_lower = destination.lower()
+
+            # Premium tourist destinations
+            if destination_lower in ['kashmir', 'goa', 'kerala', 'rajasthan', 'himachal pradesh']:
+                return 800
+            # Major metropolitan cities
+            elif destination_lower in ['delhi', 'mumbai', 'bangalore', 'chennai', 'kolkata', 'pune']:
+                return 600
+            # Popular hill stations
+            elif destination_lower in ['shimla', 'manali', 'darjeeling', 'ooty', 'nainital']:
+                return 700
+            # Historical/cultural cities
+            elif destination_lower in ['jaipur', 'agra', 'varanasi', 'amritsar', 'mysore']:
+                return 550
+            # Other destinations
+            else:
+                return 400
+
+        base_hostel_cost = get_accommodation_cost(destination)
+
+        # 4. Fetch accommodation with real pricing data
+        accommodation = []
+
+        # Fetch hostel data from Geoapify API
+        hostel_url = f"https://api.geoapify.com/v2/places?categories=accommodation.hostel&filter=circle:{lng},{lat},5000&limit=2&apiKey={api_key}"
+        hostel_response = requests.get(hostel_url).json()
+
+        if hostel_response.get('features'):
+            for place in hostel_response['features']:
+                props = place['properties']
+
+                # Extract real pricing information from the API response
+                # Look for price indicators in the properties
+                base_price = 400  # Default fallback
+
+                # Try to extract price from various fields that might contain pricing info
+                price_indicators = [
+                    props.get('price'),
+                    props.get('price_range'),
+                    props.get('cost'),
+                    props.get('rate')
+                ]
+
+                for indicator in price_indicators:
+                    if indicator:
+                        # Try to extract numeric price
+                        price_str = str(indicator).replace('₹', '').replace('$', '').replace('USD', '').replace('INR', '')
+                        try:
+                            extracted_price = float(price_str)
+                            if 100 <= extracted_price <= 2000:  # Reasonable price range
+                                base_price = extracted_price
+                                break
+                        except ValueError:
+                            continue
+
+                # If no price found, use our dynamic pricing based on destination
+                if base_price == 400:
+                    base_price = get_accommodation_cost(destination)
+
+                acc = {
+                    "id": id_counter,
+                    "name": props.get('name', 'Hostel'),
+                    "type": "hostel",
+                    "cost_per_night": int(base_price)
+                }
+                accommodation.append(acc)
+                id_counter += 1
+        else:
+            # Fallback: Add a default hostel if no API data available
+            acc = {
+                "id": id_counter,
+                "name": "Standard Hostel",
+                "type": "hostel",
+                "cost_per_night": get_accommodation_cost(destination)
+            }
+            accommodation.append(acc)
+            id_counter += 1
+            
+        # 5. Calculate real transport costs based on destination and typical fares
+        def calculate_transport_costs(destination, location_data):
+            """
+            Calculate realistic transport costs based on destination characteristics
+            """
+            destination_lower = destination.lower()
+            lng, lat = location_data
+
+            # Base costs that vary by destination type and transportation infrastructure
+            if destination_lower in ['kashmir', 'himachal pradesh', 'uttarakhand']:
+                # Mountain destinations with specialized transport
+                return {
+                    "shared_taxi": {"cost_per_trip": 80, "description": "Shared taxi (sumo/tempo)"},
+                    "local_bus": {"cost_per_trip": 40, "description": "Local bus"},
+                    "auto_rickshaw": {"cost_per_trip": 30, "description": "Auto rickshaw"},
+                    "private_taxi": {"cost_per_trip": 400, "description": "Private taxi (full day)"}
+                }
+            elif destination_lower in ['delhi', 'mumbai', 'bangalore', 'chennai', 'kolkata', 'pune']:
+                # Metro cities with extensive public transport
+                return {
+                    "metro": {"cost_per_trip": 30, "description": "Metro rail"},
+                    "local_bus": {"cost_per_trip": 25, "description": "City bus"},
+                    "auto_rickshaw": {"cost_per_trip": 50, "description": "Auto rickshaw"},
+                    "ride_share": {"cost_per_trip": 100, "description": "Uber/Ola"},
+                    "private_taxi": {"cost_per_trip": 300, "description": "Private taxi"}
+                }
+            elif destination_lower in ['goa', 'kerala']:
+                # Coastal/beach destinations
+                return {
+                    "local_bus": {"cost_per_trip": 35, "description": "Local bus"},
+                    "auto_rickshaw": {"cost_per_trip": 40, "description": "Auto rickshaw"},
+                    "scooter_rental": {"cost_per_trip": 200, "description": "Scooter rental (per day)"},
+                    "private_taxi": {"cost_per_trip": 250, "description": "Private taxi"}
+                }
+            else:
+                # Standard transport for other destinations
+                return {
+                    "local_bus": {"cost_per_trip": 30, "description": "Local bus"},
+                    "auto_rickshaw": {"cost_per_trip": 35, "description": "Auto rickshaw"},
+                    "shared_taxi": {"cost_per_trip": 50, "description": "Shared taxi"},
+                    "private_taxi": {"cost_per_trip": 200, "description": "Private taxi"}
+                }
+
+        transport = calculate_transport_costs(destination, location)
+
+        return {
+            "points_of_interest": points_of_interest,
+            "accommodation": accommodation,
+            "transport": transport
+        }
+
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Network error while fetching data: {e}"}
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {e}"}
+
+def retrieve_candidates(interests, db):
+    """Filters POIs based on user interests."""
+    return [poi for poi in db["points_of_interest"] if poi["type"] in interests]
+
+def cost_estimator(plan_activities, db, days):
+    """Estimates the total cost of a structured plan."""
+    total_cost = 0
+    
+    # Accommodation cost
+    accommodation_cost = 0
+    if db.get("accommodation"):
+        hostel_cost = db["accommodation"][0]["cost_per_night"]
+        accommodation_cost = hostel_cost * (days - 1)
+        total_cost += accommodation_cost
+        print(f"🏨 Accommodation: {accommodation_cost} (₹{hostel_cost}/night × {days-1} nights)")
+    
+    # Activity costs
+    activity_cost = 0
+    for item in plan_activities:
+        item_cost = item.get("cost", 0)
+        activity_cost += item_cost
+        if item_cost > 0:
+            print(f"🎯 Activity {item.get('name', 'Unknown')}: ₹{item_cost}")
+    total_cost += activity_cost
+    
+    # Transport cost
+    trips_per_day = max(0, (len(plan_activities) / days) - 1)
+    
+    # Use the most economical transport option available
+    transport_options = db["transport"]
+    available_transport = [t for t in transport_options.values() if t["cost_per_trip"] > 0]
+    
+    if available_transport:
+        # Choose the cheapest available transport option
+        cheapest_transport = min(available_transport, key=lambda x: x["cost_per_trip"])
+        transport_cost_per_trip = cheapest_transport["cost_per_trip"]
+        transport_type = next(t for t in transport_options.keys() if transport_options[t] == cheapest_transport)
+        print(f"🚗 Using {transport_type}: ₹{transport_cost_per_trip} per trip")
+    else:
+        transport_cost_per_trip = 0
+        print("🚶 No paid transport options available")
+    
+    transport_cost = transport_cost_per_trip * trips_per_day * days
+    total_cost += transport_cost
+    print(f"💰 Total estimated cost: ₹{total_cost}")
+
+    return total_cost
+
+def generate_itinerary(user_request):
+    """Main orchestrator function for generating the travel plan."""
+    db = fetch_real_data(user_request["destination"])
+    
+    if not db or (isinstance(db, dict) and "error" in db):
+        return db
+    
+    candidates = retrieve_candidates(user_request["interests"], db)
+    if not candidates:
+        return {"error": "No activities found for the selected interests."}
+
+    days = user_request["duration_days"]
+    pois_per_day = (len(candidates) + days - 1) // days
+    
+    structured_plan = {}
+    for i in range(days):
+        day_pois = candidates[i*pois_per_day:(i+1)*pois_per_day]
+        structured_plan[f"day{i+1}"] = day_pois
+
+    refined_itinerary = call_llm_for_refinement(structured_plan, user_request)
+    if "error" in refined_itinerary:
+        return refined_itinerary
+
+    estimated_cost = cost_estimator(candidates, db, days)
+    refined_itinerary['estimated_total_cost'] = f"₹{estimated_cost:,.2f}"
+    refined_itinerary['budget_compliance'] = "✅ Within Budget" if estimated_cost <= user_request['budget_inr'] else "⚠️ Over Budget"
+    
+    return refined_itinerary
