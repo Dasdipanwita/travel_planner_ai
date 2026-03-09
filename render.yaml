@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: nomadai-student-planner
+    env: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: GEOAPIFY_API_KEY
+        sync: false
+      - key: HF_TOKEN
+        sync: false
