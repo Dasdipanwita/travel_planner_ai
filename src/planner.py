@@ -69,6 +69,10 @@ def _haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     km = 6371 * c
     return km
 
+
+def _safe_lower(value: Any) -> str:
+    return str(value or "").lower()
+
 def fetch_real_data(destination: str, interests: Optional[List[str]] = None) -> Dict[str, Any]:
     """Fetch real data from Geoapify API for the given destination.
 
@@ -117,7 +121,7 @@ def fetch_real_data(destination: str, interests: Optional[List[str]] = None) -> 
 
                 # Get real activity costs based on place details and type
                 def get_real_activity_cost(place_type, props, destination):
-                    destination_lower = destination.lower()
+                    destination_lower = _safe_lower(destination)
 
                     # First try to extract price from the place data
                     real_price = None
@@ -153,7 +157,8 @@ def fetch_real_data(destination: str, interests: Optional[List[str]] = None) -> 
 
                         elif place_type == 'culture':
                             # Cultural sites entry fees
-                            if any(word in props.get('name', '').lower() for word in ['museum', 'fort', 'palace', 'temple']):
+                            place_name = _safe_lower(props.get('name', ''))
+                            if any(word in place_name for word in ['museum', 'fort', 'palace', 'temple']):
                                 if destination_lower in ['kashmir', 'rajasthan', 'kerala']:
                                     return 200  # Premium cultural sites
                                 else:
@@ -163,7 +168,8 @@ def fetch_real_data(destination: str, interests: Optional[List[str]] = None) -> 
 
                         elif place_type == 'activity':
                             # Adventure activities
-                            if any(word in props.get('name', '').lower() for word in ['trekking', 'boating', 'rafting', 'camping']):
+                            place_name = _safe_lower(props.get('name', ''))
+                            if any(word in place_name for word in ['trekking', 'boating', 'rafting', 'camping']):
                                 if destination_lower in ['kashmir', 'himachal', 'kerala']:
                                     return 500  # Premium adventure activities
                                 else:
@@ -173,7 +179,8 @@ def fetch_real_data(destination: str, interests: Optional[List[str]] = None) -> 
 
                         else:  # nature
                             # Nature sites are often free or low cost
-                            if any(word in props.get('name', '').lower() for word in ['national park', 'sanctuary', 'garden']):
+                            place_name = _safe_lower(props.get('name', ''))
+                            if any(word in place_name for word in ['national park', 'sanctuary', 'garden']):
                                 return 100  # Entry fees for protected areas
                             else:
                                 return 20  # Small parks and viewpoints
@@ -199,7 +206,7 @@ def fetch_real_data(destination: str, interests: Optional[List[str]] = None) -> 
 
         # Dynamic accommodation pricing based on destination type and popularity
         def get_accommodation_cost(destination):
-            destination_lower = destination.lower()
+            destination_lower = _safe_lower(destination)
 
             # Premium tourist destinations
             if destination_lower in ['kashmir', 'goa', 'kerala', 'rajasthan', 'himachal pradesh']:
@@ -282,7 +289,7 @@ def fetch_real_data(destination: str, interests: Optional[List[str]] = None) -> 
             """
             Calculate realistic transport costs based on destination characteristics
             """
-            destination_lower = destination.lower()
+            destination_lower = _safe_lower(destination)
             lng, lat = location_data
 
             # Base costs that vary by destination type and transportation infrastructure
