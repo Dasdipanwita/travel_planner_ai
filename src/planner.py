@@ -1,24 +1,92 @@
 # src/planner.py
-import requests  # <-- THIS LINE FIXES THE ERROR
+import logging
+import math
+from typing import Any, Dict, List, Optional
+
+import requests
+
 from src.config import Config
 from src.llm_handler import call_llm_for_refinement
 
-def fetch_real_data(destination):
-    """Fetch real data from Geoapify API for the given destination."""
+logger = logging.getLogger(__name__)
+
+
+def _geocode_destination(destination: str, api_key: str) -> Dict[str, Any]:
+    """Resolve a destination to coordinates using Geoapify with a Nominatim fallback."""
+    headers = {"User-Agent": "NomadAI/1.0"}
+
+    try:
+        geocode_resp = requests.get(
+            "https://api.geoapify.com/v1/geocode/search",
+            params={"text": destination, "apiKey": api_key},
+            headers=headers,
+            timeout=10,
+        )
+        if geocode_resp.status_code == 200:
+            geocode_response = geocode_resp.json()
+            features = geocode_response.get("features") or []
+            if features:
+                coordinates = features[0].get("geometry", {}).get("coordinates", [])
+                if len(coordinates) >= 2:
+                    return {"lng": coordinates[0], "lat": coordinates[1], "source": "geoapify"}
+            logger.warning("Geoapify geocoding returned no results for '%s'", destination)
+        else:
+            logger.warning("Geoapify geocoding failed for '%s' with status %s", destination, geocode_resp.status_code)
+    except requests.exceptions.RequestException:
+        logger.exception("Geoapify geocoding request failed for '%s'", destination)
+
+    try:
+        fallback_resp = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": destination, "format": "json", "limit": 1},
+            headers=headers,
+            timeout=10,
+        )
+        if fallback_resp.status_code == 200:
+            fallback_results = fallback_resp.json()
+            if fallback_results:
+                first = fallback_results[0]
+                return {
+                    "lng": float(first["lon"]),
+                    "lat": float(first["lat"]),
+                    "source": "nominatim",
+                }
+        logger.warning("Nominatim geocoding returned no results for '%s'", destination)
+    except (requests.exceptions.RequestException, ValueError, KeyError, TypeError):
+        logger.exception("Nominatim geocoding request failed for '%s'", destination)
+
+    return {"error": "Could not geocode the destination. Please check the destination name."}
+
+
+def _haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Calculate great-circle distance between two points (km)."""
+    # convert decimal degrees to radians
+    lon1, lat1, lon2, lat2 = map(math.radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    c = 2 * math.asin(math.sqrt(a))
+    km = 6371 * c
+    return km
+
+def fetch_real_data(destination: str, interests: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Fetch real data from Geoapify API for the given destination.
+
+    Uses `interests` to limit category queries when possible.
+    """
     api_key = Config.GEOAPIFY_API_KEY
     if not api_key:
         return {"error": "Geoapify API key is missing. Please set it in your .env file."}
 
     try:
         # 1. Geocode destination to get lat/lng
-        geocode_url = f"https://api.geoapify.com/v1/geocode/search?text={destination}&apiKey={api_key}"
-        geocode_response = requests.get(geocode_url).json()
-        
-        if not geocode_response.get('features'):
-            return {"error": "Could not geocode the destination. Please check the destination name."}
+        location_data = _geocode_destination(destination, api_key)
+        if "error" in location_data:
+            return location_data
 
-        location = geocode_response['features'][0]['geometry']['coordinates']
-        lng, lat = location[0], location[1]
+        lng = location_data["lng"]
+        lat = location_data["lat"]
+        location = [lng, lat]
 
         # 2. Map interests to Geoapify categories
         category_mapping = {
@@ -31,9 +99,8 @@ def fetch_real_data(destination):
         points_of_interest = []
         id_counter = 1
         
-        # Correctly get user interests from the request to build the query
-        user_interests = category_mapping.keys() # You can refine this later if needed
-        categories_to_fetch = ",".join([category_mapping[i] for i in user_interests])
+        selected_interests = interests if interests else list(category_mapping.keys())
+        categories_to_fetch = ",".join([category_mapping[i] for i in selected_interests if i in category_mapping])
 
         # 3. Fetch places of interest
         places_url = f"https://api.geoapify.com/v2/places?categories={categories_to_fetch}&filter=circle:{lng},{lat},5000&limit=20&apiKey={api_key}"
@@ -316,7 +383,7 @@ def cost_estimator(plan_activities, db, days):
 
 def generate_itinerary(user_request):
     """Main orchestrator function for generating the travel plan."""
-    db = fetch_real_data(user_request["destination"])
+    db = fetch_real_data(user_request["destination"], user_request.get("interests"))
     
     if not db or (isinstance(db, dict) and "error" in db):
         return db
@@ -338,7 +405,11 @@ def generate_itinerary(user_request):
         return refined_itinerary
 
     estimated_cost = cost_estimator(candidates, db, days)
+    num_people = int(user_request.get("num_people", 1) or 1)
     refined_itinerary['estimated_total_cost'] = f"₹{estimated_cost:,.2f}"
+    refined_itinerary['estimated_per_person'] = f"₹{(estimated_cost / num_people):,.2f}"
+    refined_itinerary['estimate_range'] = f"₹{estimated_cost * 0.90:,.2f} - ₹{estimated_cost * 1.15:,.2f}"
     refined_itinerary['budget_compliance'] = "✅ Within Budget" if estimated_cost <= user_request['budget_inr'] else "⚠️ Over Budget"
+    refined_itinerary['has_beach'] = any(poi.get('is_beach') for poi in db.get('points_of_interest', []))
     
     return refined_itinerary
